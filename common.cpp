@@ -87,7 +87,7 @@ libusb_device **FindPort(int pid) {
 			libusb_ref_device(dev);
 		}
 	}
-	libusb_delete[]_device_list(devs, 1);
+	libusb_free_device_list(devs, 1);
 	if (count > 0) ports[count] = nullptr;
 	return ports;
 }
