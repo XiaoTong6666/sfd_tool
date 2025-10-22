@@ -8,6 +8,8 @@ import sys
 import time
 import struct
 import logging
+import struct
+import uuid
 from typing import Optional, List, Tuple
 from enum import IntEnum
 
@@ -253,91 +255,123 @@ class SpdProtocol:
         self.ep_out.write(packet)
 
     def recv_msg(self, timeout: Optional[int] = None) -> Tuple[int, bytes]:
-        """接收、解码并验证一个完整的BSL消息"""
+        """
+        接收、解码并验证一个完整的BSL消息。
+        这个版本精确地模仿了C++的 recv_msg_orig 和 recv_transcode 的协同工作逻辑。
+        """
         if timeout is None:
             timeout = self.timeout
 
-        raw_data = bytearray()
-        # 持续读取直到找到消息的起始和结束
+        start_time = time.time()
+
+        raw_buf = bytearray() # 对应 C++ 的 io->raw_buf
+        expected_len = 6      # 对应 C++ 的 plen，初始为最小长度
+
         while True:
+            # 1. 检查总体超时
+            if (time.time() - start_time) > (timeout / 1000.0):
+                raise SpdProtocolError(f"Receive timeout after {timeout}ms.")
+
+            # 2. 读取一块数据 (对应 recv_read_data)
             try:
-                chunk = self.ep_in.read(self.ep_in.wMaxPacketSize, timeout)
-                raw_data.extend(chunk)
-                if raw_data.count(HDLC_HEADER) >= 2:
-                    break
+                chunk = self.ep_in.read(self.ep_in.wMaxPacketSize, timeout=100)
+                if self.verbose >= 2: log.debug(f"RAW RECV CHUNK < {bytes(chunk).hex()}")
             except usb.core.USBError as e:
-                if e.errno == 110:  # Timeout
-                    raise SpdProtocolError("Receive timeout")
+                if e.errno == 110: continue
                 raise
 
-        if self.verbose >= 2:
-            log.debug(f"RECV < {bytes(raw_data).hex()}")
+            # 3. 将数据块送入解码器 (对应 recv_transcode 的逻辑)
 
-        # 剥离HDLC帧
-        start = raw_data.find(HDLC_HEADER)
-        end = raw_data.find(HDLC_HEADER, start + 1)
-        if start == -1 or end == -1:
-            raise SpdProtocolError("Invalid HDLC frame received")
+            # -- 这是 recv_transcode 的内部 while 循环的 Python 实现 --
+            head_found = len(raw_buf) > 0
+            esc = False # esc 状态只在循环内部有效
 
-        framed_data = raw_data[start+1:end]
+            for byte in chunk:
+                if self.flags['transcode']:
+                    # --- Transcode 模式逻辑 ---
+                    if esc:
+                        byte ^= HDLC_ESCAPE_MASK
+                        esc = False
+                    elif byte == HDLC_ESCAPE:
+                        esc = True
+                        continue
+                    elif byte == HDLC_HEADER:
+                        if not head_found:
+                            head_found = True
+                            raw_buf.clear() # 确保从一个干净的缓冲区开始
+                            expected_len = 6
+                        else: # 遇到第二个 0x7E
+                            # C++ 在这里会检查 nread < plen 并报错，我们在这里先忽略，让外部循环判断
+                            # 实际上，在 transcode 模式下，第二个 0x7E 总是帧的结束
+                            pass
+                        continue
 
-        # 反转义
-        if self.flags['transcode']:
-            payload = self._untranscode(framed_data)
+                    if not head_found: continue
+                    raw_buf.append(byte)
+
+                else:
+                    # --- Non-transcode 模式逻辑 ---
+                    if not head_found:
+                        if byte == HDLC_HEADER:
+                            head_found = True
+                        continue
+
+                    if len(raw_buf) == expected_len:
+                        if byte == HDLC_HEADER: # 满足结束条件
+                            break # 跳出 for 循环
+                        else:
+                            # 数据流错误，重置状态以寻找下一个帧
+                            log.warning("Non-transcode stream error: expected HDLC_HEADER at end of payload.")
+                            head_found = False
+                            continue
+
+                    raw_buf.append(byte)
+
+                # 只要累积到4个字节，就更新预期长度
+                if len(raw_buf) == 4:
+                    _, msg_len_header = struct.unpack('>HH', raw_buf[:4])
+                    expected_len = msg_len_header + 6
+
+            # 4. 检查是否接收完毕 (对应 recv_msg_orig 的外部 while 循环)
+            if len(raw_buf) >= expected_len:
+                # 如果是 non-transcode 模式，我们可能多读了一个 0x7E，所以用 >=
+                break
+
+        # 5. 校验 (对应 recv_check_crc)
+        final_payload = raw_buf[:expected_len]
+        # (校验逻辑和之前一样)
+        msg_type, msg_len = struct.unpack('>HH', final_payload[:4])
+        received_crc = struct.unpack('>H', final_payload[-2:])[0]
+
+        is_valid = False
+        current_mode_is_crc16 = self.flags['crc16']
+        expected_crc = self._spd_crc16(final_payload[:-2]) if current_mode_is_crc16 else self._spd_checksum(final_payload[:-2])
+
+        if received_crc == expected_crc:
+            is_valid = True
         else:
-            payload = framed_data
+            alt_mode_is_crc16 = not current_mode_is_crc16
+            alt_crc = self._spd_crc16(final_payload[:-2]) if alt_mode_is_crc16 else self._spd_checksum(final_payload[:-2])
+            if received_crc == alt_crc:
+                log.info("Alternative checksum matched. Switching mode.")
+                self.flags['crc16'] = alt_mode_is_crc16
+                is_valid = True
 
-        if len(payload) < 6: # Type(2) + Len(2) + CRC(2)
-            raise SpdProtocolError(f"Received packet too short: {len(payload)} bytes")
-
-        # 解包
-        msg_type, msg_len = struct.unpack('>HH', payload[:4])
-        msg_data = payload[4:-2]
-        received_crc = struct.unpack('>H', payload[-2:])[0]
-
-        if len(msg_data) != msg_len:
-            raise SpdProtocolError(f"Packet length mismatch: expected {msg_len}, got {len(msg_data)}")
-
-        # 校验CRC
-        calc_crc16 = self._spd_crc16(payload[:-2])
-        calc_sum = self._spd_checksum(payload[:-2])
-
-        if self.verbose >= 2:
-            log.debug("--- Checksum Debug ---")
-            log.debug(f"Payload to check: {payload[:-2].hex()}")
-            log.debug(f"Received Checksum:  {received_crc:#06x}")
-            log.debug(f"Calculated CRC16:   {calc_crc16:#06x}")
-            log.debug(f"Calculated SUM:     {calc_sum:#06x}")
-            log.debug("----------------------")
-
-        expected_crc_val = calc_crc16 if self.flags['crc16'] else calc_sum
-
-        if received_crc != expected_crc_val:
-            log.warning(f"Checksum mismatch! Got {received_crc:#06x}, expected {expected_crc_val:#06x}. Trying alternative checksum...")
-            alt_is_crc16 = not self.flags['crc16']
-            alt_crc_val = self._spd_crc16(payload[:-2]) if alt_is_crc16 else self._spd_checksum(payload[:-2])
-
-            if received_crc == alt_crc_val:
-                log.info(f"Alternative checksum ({'CRC16' if alt_is_crc16 else 'SUM'}) matched. Permanently switching mode.")
-                self.flags['crc16'] = alt_is_crc16
-            else:
-                raise SpdProtocolError(f"Checksum validation failed! Got {received_crc:#06x}, expected {expected_crc_val:#06x} (current mode) or {alt_crc_val:#06x} (alternative mode).")
-
+        if not is_valid:
+            raise SpdProtocolError(f"Checksum validation failed! Got {received_crc:#06x}, expected {expected_crc:#06x}.")
 
         if self.verbose >= 1:
-             try:
-                log.info(f"RECV < REP: {BSL_REP(msg_type).name} ({msg_type:#04x}), Size: {msg_len}")
-             except ValueError:
-                log.info(f"RECV < REP: UNKNOWN ({msg_type:#04x}), Size: {msg_len}")
+            try: log.info(f"RECV < REP: {BSL_REP(msg_type).name} ({msg_type:#04x}), Size: {msg_len}")
+            except ValueError: log.info(f"RECV < REP: UNKNOWN ({msg_type:#04x}), Size: {msg_len}")
 
+        return msg_type, final_payload[4:-2]
 
-        return msg_type, msg_data
-
-    def send_and_check_ack(self, cmd: int, data: bytes = b'') -> bytes:
-        """发送命令并期望收到ACK，如果成功则返回ACK中的数据"""
+    def send_and_check_ack(self, cmd: int, data: bytes = b'', timeout: Optional[int] = None) -> bytes:
+        """发送命令并期望收到ACK，如果成功则返回ACK中的数据。允许覆盖超时。"""
         while True:
             self.send_cmd(cmd, data)
-            rep_type, rep_data = self.recv_msg()
+            # 如果没有提供自定义超时，则使用默认值
+            rep_type, rep_data = self.recv_msg(timeout=timeout)
             if rep_type == BSL_REP.LOG:
                 log.info(f"Device Log: {rep_data.decode('utf-8', errors='ignore')}")
                 continue # 继续等待真正的响应
@@ -345,17 +379,56 @@ class SpdProtocol:
                 raise SpdProtocolError(f"Expected ACK, but got {BSL_REP(rep_type).name if rep_type in BSL_REP else rep_type:#04x}")
             return rep_data
 
+    def _clear_in_buffer(self):
+        """通过以短超时持续读取来清空IN端点缓冲区中的所有陈旧数据。"""
+        if self.verbose >= 2:
+            log.debug("Clearing IN endpoint buffer...")
+        cleared_bytes_count = 0
+        while True:
+            try:
+                # 使用非常短的超时（1毫秒）来尝试读取。
+                # 如果有数据，它会立即返回。如果没有，它会立即超时。
+                data = self.ep_in.read(self.ep_in.wMaxPacketSize, timeout=1)
+                cleared_bytes_count += len(data)
+            except usb.core.USBError as e:
+                # 捕获预期的超时错误，这意味着缓冲区已空。
+                # 在 Linux 上 errno 通常是 110 (ETIMEDOUT)
+                if e.errno == 110 or 'timeout' in str(e).lower():
+                    break
+                # 如果是其他USB错误，则重新引发
+                else:
+                    raise
+
+        if cleared_bytes_count > 0 and self.verbose >= 2:
+            log.debug(f"Cleared {cleared_bytes_count} stale bytes from buffer.")
+
+    def read_flash(self, addr: int, offset: int, size: int) -> bytes:
+        """
+        一个底层的辅助函数，用于从给定的物理地址读取数据块。
+        这对应于 C++ 中的 BSL_CMD_READ_FLASH。
+        """
+        # 构造请求包: addr (u32), size (u32), offset (u32)
+        # 注意：这些是32位的值
+        req_packet = struct.pack('>III', addr, size, offset)
+
+        # 发送命令并期望收到 READ_FLASH 响应
+        self.send_cmd(BSL_CMD.READ_FLASH, req_packet)
+        rep_type, rep_data = self.recv_msg()
+
+        if rep_type != BSL_REP.READ_FLASH:
+            raise SpdProtocolError(f"Expected READ_FLASH response, but got {rep_type:#04x}")
+
+        return rep_data
+
 class SfdTool:
     """实现sfd_tool的高级功能"""
     COMMON_PARTITIONS = [
-        "splloader", "prodnv", "miscdata", "recovery", "misc", "trustos", "sml",
-        "uboot", "logo", "fbootlogo", "l_fixnv1", "l_fixnv2", "l_runtimenv1",
+        "splloader", "prodnv", "miscdata", "recovery", "misc", "trustos","trustos_bak",
+        "sml", "sml_bak","uboot", "uboot_bak","uboot_log", "logo", "logo_2", "logo_3", "logo_4",
+        "logo_5", "logo_6", "fbootlogo", "l_fixnv1", "l_fixnv2", "l_runtimenv1",
         "l_runtimenv2", "gpsgl", "gpsbd", "wcnmodem", "persist", "l_modem",
         "l_deltanv", "l_gdsp", "l_ldsp", "pm_sys", "boot", "system", "cache",
-        "vendor", "userdata", "dtb", "socko", "vbmeta", "vbmeta_system",
-        "trustos_a", "trustos_b", "sml_a", "sml_b", "teecfg", "teecfg_a", "teecfg_b",
-        "uboot_a", "uboot_b", "boot_a", "boot_b", "dtb_a", "dtb_b", "dtbo_a", "dtbo_b",
-        "super", "vbmeta_a", "vbmeta_b", "metadata"
+        "vendor", "userdata", "vbmeta", "vbmeta_bak"
     ]
 
     def __init__(self, wait_time: int, verbose: int):
@@ -409,8 +482,8 @@ class SfdTool:
         log.debug("--- USB Device Debug Information ---")
         try:
             # 尝试查找PyUSB后端
-            if usb.core.find() is None and usb.core.find() is None: # 简单的后端检查
-                 pass
+            if usb.core.find() is None:
+                log.debug("No USB backend found (libusb missing?)") # 简单的后端检查
 
             devices = list(usb.core.find(find_all=True))
             if not devices:
@@ -480,44 +553,6 @@ class SfdTool:
         log.info(f"Device found and ready: {dev.product} by {dev.manufacturer}")
         self.proto = SpdProtocol(dev, self.verbose)
         return dev
-
-    def _print_usb_debug_info(self):
-        """扫描并打印所有可见的USB设备以供调试。"""
-        log.debug("--- USB Device Debug Information ---")
-        try:
-            # 尝试查找PyUSB后端
-            if usb.core.find() is None and usb.core.find() is None: # 简单的后端检查
-                 pass
-
-            devices = list(usb.core.find(find_all=True))
-            if not devices:
-                log.debug("No USB devices found by pyusb. Check backend (libusb) and permissions.")
-                log.debug("------------------------------------")
-                return
-
-            log.debug(f"Found {len(devices)} USB device(s):")
-            for dev in devices:
-                try:
-                    manufacturer = dev.manufacturer
-                    product = dev.product
-                except Exception:
-                    # 某些设备（尤其是在特殊模式下）可能没有字符串描述符
-                    manufacturer = "N/A"
-                    product = "N/A"
-
-                # 高亮显示展讯的设备
-                marker = ""
-                if dev.idVendor == SPD_VID:
-                    marker = " ---> TARGET VENDOR"
-
-                log.debug(f"  - VID:PID={dev.idVendor:04x}:{dev.idProduct:04x} | {manufacturer} - {product}{marker}")
-
-        except usb.core.NoBackendError:
-            log.error("PyUSB backend not found! Please ensure libusb is installed and accessible.")
-        except Exception as e:
-            log.error(f"An unexpected error occurred while scanning USB devices: {e}")
-
-        log.debug("------------------------------------")
 
     def handshake(self):
         """与设备执行初始握手以确定其状态，精确模仿C++流程。"""
@@ -764,72 +799,31 @@ class SfdTool:
     def _get_partition_table(self):
         """
         在FDL2阶段获取设备分区表。
-        如果标准命令失败，则回退到兼容性探测模式。
+        优先尝试高效的GPT解析，如果失败，则回退到兼容性探测模式。
         """
         if self.device_stage != "FDL2" or not self.proto:
             return
 
-        log.info("Reading partition table (standard method)...")
         self.partitions = []
-        standard_method_failed = False
 
-        try:
-            self.proto.send_cmd(BSL_CMD.READ_PARTITION)
-            rep_type, rep_data = self.proto.recv_msg()
+        # --- 优先尝试新方法 ---
+        if self._get_partitions_from_gpt():
+            return  # 成功，任务完成！
 
-            if rep_type == BSL_REP.READ_PARTITION:
-                # --- 标准方法成功 ---
-                chunk_size = 76
-                if len(rep_data) % chunk_size != 0:
-                    log.warning("Received partition data size is not a multiple of entry size.")
+        # --- 如果 GPT 方法失败，回退到原来的慢速方法 ---
+        log.info("GPT method failed. Switching to compatibility mode (probing common partitions)...")
+        original_verbose = self.proto.verbose
+        if self.verbose > 0: self.proto.verbose = 0
 
-                for i in range(0, len(rep_data), chunk_size):
-                    chunk = rep_data[i:i + chunk_size]
-                    if len(chunk) < chunk_size: continue
+        for part_name in self.COMMON_PARTITIONS:
+            print(f"\rProbing: {part_name:<20}", end="")
+            exists, size_in_bytes = self.check_partition(part_name)
+            if exists:
+                self.partitions.append({'name': part_name, 'size': size_in_bytes})
 
-                    try:
-                        name = chunk[0:72].decode('utf-16le').split('\x00', 1)[0]
-                        size_in_sectors = struct.unpack('<I', chunk[72:76])[0]
-                        # 假设扇区大小为512，这对于eMMC/UFS是标准值
-                        size_in_bytes = size_in_sectors * 512
-                        if name: self.partitions.append({'name': name, 'size': size_in_bytes})
-                    except (UnicodeDecodeError, struct.error):
-                        continue
-
-                log.info(f"Successfully read {len(self.partitions)} partitions via standard method.")
-                return # 成功，函数结束
-
-            elif rep_type == BSL_REP.UNSUPPORTED_COMMAND:
-                log.warning("Standard READ_PARTITION command is not supported by this FDL.")
-                standard_method_failed = True
-            else:
-                log.error(f"Failed to get partition table, received unexpected response: {rep_type:#04x}")
-                standard_method_failed = True
-
-        except SpdProtocolError as e:
-            log.error(f"Error during standard partition read: {e}")
-            standard_method_failed = True
-
-        # --- 兼容性方法 (备用方案) ---
-        if standard_method_failed:
-            log.info("Switching to compatibility mode (probing common partitions)...")
-            original_verbose = self.proto.verbose
-            if self.verbose > 0: self.proto.verbose = 0
-
-            for part_name in self.COMMON_PARTITIONS:
-                print(f"\rProbing: {part_name:<20}", end="")
-                # --- 开始修改 ---
-                # 调用新的、功能更强大的探测函数
-                exists, size_in_bytes = self.check_partition(part_name)
-                if exists:
-                    # 记录探测到的名称和大小
-                    self.partitions.append({'name': part_name, 'size': size_in_bytes})
-
-            print() # 换行
-            # 恢复日志级别
-            self.proto.verbose = original_verbose
-
-            log.info(f"Found {len(self.partitions)} partitions via compatibility mode.")
+        print() # 换行
+        self.proto.verbose = original_verbose
+        log.info(f"Found {len(self.partitions)} partitions via compatibility mode.")
 
     def cmd_print_partitions(self):
         """格式化并打印已加载的分区表。"""
@@ -876,47 +870,228 @@ class SfdTool:
         except SpdProtocolError as e:
             log.warning(f"Keep charge command failed (this is normal on some devices): {e}")
 
+    def _find_partition_info(self, name: str) -> Optional[dict]:
+        """从已加载的分区列表中查找分区的名称和大小。"""
+        for part in self.partitions:
+            if part['name'] == name:
+                return part
+        return None
+
+    def _print_progress_bar(self, done: int, total: int, start_time: float, desc: str = ""):
+        """打印一个简单的文本进度条。"""
+        if total == 0: return
+        percent = 100 * (done / float(total))
+        elapsed_time = time.time() - start_time
+        speed = (done / elapsed_time) / (1024 * 1024) if elapsed_time > 0 else 0 # MB/s
+
+        bar_len = 40
+        filled_len = int(bar_len * done // total)
+        bar = '=' * filled_len + '-' * (bar_len - filled_len)
+
+        print(f'\r{desc:<10} [{bar}] {percent:6.2f}% ({speed:5.2f} MB/s)', end='')
+        if done == total:
+            print()
+
     def cmd_read_part(self, partition_name: str, out_file: str):
-        """读取分区到文件 (简化版)"""
+        """从设备读取一个分区并将其保存到文件。"""
         if self.device_stage != "FDL2":
             log.error("Reading partitions is only supported in FDL2 stage.")
             return
         if not self.proto: return
+        # 清理缓冲区的调用
+        self.proto._clear_in_buffer()
 
-        # 这是一个非常简化的实现，实际需要先获取分区表和大小
-        # 这里假设分区大小是已知的
-        part_size_to_read = 1024 * 1024 # 示例：读取1MB
-        log.info(f"Reading partition '{partition_name}' to '{out_file}'...")
+        log.info(f"Attempting to read partition '{partition_name}' to file '{out_file}'...")
+        part_info = self._find_partition_info(partition_name)
+        if not part_info:
+            log.error(f"Partition '{partition_name}' not found in the partition table.")
+            return
 
-        # 读取开始
-        # name, size_high, size_low
-        start_packet = partition_name.encode('utf-16le')
-        start_packet = start_packet.ljust(72, b'\x00') # 名字字段填充到36个wchar
-        start_packet += struct.pack('<II', 0, part_size_to_read) # size_high, size_low
-        self.proto.send_and_check_ack(BSL_CMD.READ_START, start_packet)
+        part_size = part_info['size']
+        if part_size == 0:
+            log.warning(f"Partition '{partition_name}' has size 0, skipping read.")
+            return
 
-        chunk_size = 4096
-        with open(out_file, "wb") as f:
-            read_bytes = 0
-            while read_bytes < part_size_to_read:
-                size_to_req = min(chunk_size, part_size_to_read - read_bytes)
-                # offset_high, offset_low, size
-                req_packet = struct.pack('<III', 0, read_bytes, size_to_req)
-                self.proto.send_cmd(BSL_CMD.READ_MIDST, req_packet)
+        log.info(f"Partition found. Name: '{part_info['name']}', Size: {part_size / (1024*1024):.2f} MB")
+        mode64 = part_size > 0xFFFFFFFF
 
-                rep_type, rep_data = self.proto.recv_msg()
-                if rep_type != BSL_REP.READ_FLASH:
-                    log.error(f"Read failed, got response: {rep_type:#04x}")
-                    break
+        try:
+            # 步骤 1: 发送 READ_START 命令
+            # 包结构: name (72字节, utf-16le) + size (8字节, u64)
+            name_bytes = part_info['name'].encode('utf-16le')
+            start_packet = name_bytes.ljust(72, b'\x00') + struct.pack('<Q', part_size)
+            self.proto.send_and_check_ack(BSL_CMD.READ_START, start_packet)
 
-                f.write(rep_data)
-                read_bytes += len(rep_data)
-                print(f"\rReading data... {read_bytes}/{part_size_to_read} bytes", end="")
-            print()
+            # 步骤 2: 循环读取数据
+            chunk_size = 4096  # 一个安全的读取块大小
+            with open(out_file, "wb") as f:
+                read_bytes = 0
+                start_time = time.time()
+                while read_bytes < part_size:
+                    size_to_req = min(chunk_size, part_size - read_bytes)
 
-        # 读取结束
-        self.proto.send_and_check_ack(BSL_CMD.READ_END)
-        log.info("Partition read successfully.")
+                    if mode64:
+                        # 对于 >4GB 的分区，使用12字节包
+                        req_packet = struct.pack('<III', size_to_req, read_bytes & 0xFFFFFFFF, (read_bytes >> 32) & 0xFFFFFFFF)
+                    else:
+                        # 对于 <4GB 的分区，使用8字节包
+                        req_packet = struct.pack('<II', size_to_req, read_bytes & 0xFFFFFFFF)
+
+                    self.proto.send_cmd(BSL_CMD.READ_MIDST, req_packet)
+                    rep_type, rep_data = self.proto.recv_msg()
+
+                    if rep_type != BSL_REP.READ_FLASH:
+                        raise SpdProtocolError(f"Read failed during transfer. Expected READ_FLASH, got {rep_type:#04x}")
+
+                    f.write(rep_data)
+                    read_bytes += len(rep_data)
+                    self._print_progress_bar(read_bytes, part_size, start_time, "Reading")
+
+            # 步骤 3: 发送 READ_END 命令
+            self.proto.send_and_check_ack(BSL_CMD.READ_END)
+            log.info(f"Successfully read partition '{partition_name}' to '{out_file}'.")
+
+        except SpdProtocolError as e:
+            log.error(f"An error occurred during read operation: {e}")
+        except IOError as e:
+            log.error(f"File write error: {e}")
+
+    def cmd_write_part(self, partition_name: str, in_file: str):
+        """将一个文件写入到设备的指定分区。"""
+        if self.device_stage != "FDL2":
+            log.error("Writing partitions is only supported in FDL2 stage.")
+            return
+        if not self.proto: return
+        # 清理缓冲区的调用
+        self.proto._clear_in_buffer()
+
+        log.info(f"Attempting to write file '{in_file}' to partition '{partition_name}'...")
+
+        try:
+            with open(in_file, "rb") as f:
+                file_data = f.read()
+            file_size = len(file_data)
+        except IOError as e:
+            log.error(f"Failed to read file '{in_file}': {e}")
+            return
+
+        part_info = self._find_partition_info(partition_name)
+        if not part_info:
+            log.error(f"Partition '{partition_name}' not found in partition table.")
+            return
+
+        if file_size > part_info['size']:
+            log.warning(f"File size ({file_size} bytes) is larger than partition size ({part_info['size']} bytes).")
+            if input("Continue anyway? (y/N): ").lower() != 'y':
+                log.info("Write operation cancelled.")
+                return
+
+        try:
+            # 步骤 1: 发送 START_DATA 命令
+            # 包结构: name (72字节, utf-16le) + size (8字节, u64)
+            name_bytes = part_info['name'].encode('utf-16le')
+            start_packet = name_bytes.ljust(72, b'\x00') + struct.pack('<Q', file_size)
+            self.proto.send_and_check_ack(BSL_CMD.START_DATA, start_packet)
+
+            # 步骤 2: 循环发送数据
+            chunk_size = 4096  # 可以尝试更大的值以提高速度, 如 65535
+            sent_bytes = 0
+            start_time = time.time()
+            for i in range(0, file_size, chunk_size):
+                chunk = file_data[i:i + chunk_size]
+                self.proto.send_and_check_ack(BSL_CMD.MIDST_DATA, chunk)
+                sent_bytes += len(chunk)
+                self._print_progress_bar(sent_bytes, file_size, start_time, "Writing")
+
+            # 步骤 3: 发送 END_DATA 命令，并使用长超时等待
+            log.info("\nFile transfer complete. Waiting for device to finish writing flash...")
+            # 这个操作可能非常耗时，特别是对于大分区
+            self.proto.send_and_check_ack(BSL_CMD.END_DATA, timeout=180000) # 3分钟超时
+            log.info(f"Successfully wrote '{in_file}' to partition '{partition_name}'.")
+
+        except SpdProtocolError as e:
+            log.error(f"An error occurred during write operation: {e}")
+
+    def _get_partitions_from_gpt(self) -> bool:
+        """
+        高效地获取分区表，通过直接读取闪存开头的物理扇区并解析GPT。
+        这精确地模仿了 C++ 版本的核心优化逻辑。
+        """
+        if not self.proto or self.device_stage != "FDL2":
+            return False
+
+        log.info("Attempting high-speed partition read via GPT parsing...")
+
+        # 我们需要读取至少 34 个扇区来确保覆盖主GPT和分区条目数组。
+        # 34 * 512 = 17408 字节。我们读取一个稍大的块以确保安全。
+        read_size = 32 * 1024  # 读取 32KB
+
+        try:
+            # 使用新的底层 read_flash 方法从物理地址 0 开始读取
+            # C++ 代码中的 dump_partition(..., "user_partition", 0, ...) 最终也是
+            # 转换成从物理地址 0 读取。
+            raw_gpt_data = self.proto.read_flash(addr=0, offset=0, size=read_size)
+
+            if len(raw_gpt_data) < read_size:
+                log.warning(f"Short read for GPT data. Expected {read_size}, got {len(raw_gpt_data)}. Parsing may fail.")
+
+        except SpdProtocolError as e:
+            log.warning(f"Failed to read physical address 0 for GPT parsing: {e}")
+            return False
+
+        try:
+            sector_size = 512
+            # GPT 头签名通常在 LBA 1 (偏移 512)
+            gpt_header_offset = sector_size
+
+            if raw_gpt_data[gpt_header_offset:gpt_header_offset+8] != b'EFI PART':
+                log.warning("GPT signature 'EFI PART' not found at offset 512.")
+                return False
+
+            # 解析GPT头，获取分区条目数组的位置和大小
+            # '>QII' 分别对应 partition_entry_lba, number_of_partition_entries, size_of_partition_entry
+            part_array_lba, num_parts, part_entry_size = struct.unpack_from(
+                '<QII', raw_gpt_data, gpt_header_offset + 72 # 注意：C++源码偏移量是72
+            )
+
+            if part_entry_size == 0 or num_parts == 0 or part_entry_size < 128:
+                log.warning(f"Invalid GPT header values: num_parts={num_parts}, entry_size={part_entry_size}")
+                return False
+
+            part_array_offset = int(part_array_lba * sector_size)
+            self.partitions = []
+
+            # 遍历分区条目数组
+            for i in range(num_parts):
+                entry_offset = part_array_offset + (i * part_entry_size)
+
+                # 检查是否有足够的数据来解析这个条目
+                if entry_offset + part_entry_size > len(raw_gpt_data):
+                    break # 数据不足，停止解析
+
+                # 从条目中提取起始LBA，结束LBA和分区名
+                start_lba, end_lba = struct.unpack_from('<QQ', raw_gpt_data, entry_offset + 32)
+
+                if start_lba == 0: continue # 空条目
+
+                name_bytes = raw_gpt_data[entry_offset + 56 : entry_offset + 56 + 72]
+                part_name = name_bytes.decode('utf-16le').split('\x00', 1)[0]
+
+                part_size = (end_lba - start_lba + 1) * sector_size
+
+                if part_name:
+                    self.partitions.append({'name': part_name, 'size': part_size})
+
+            if not self.partitions:
+                log.warning("GPT parsed, but no valid partitions were found.")
+                return False
+
+            log.info(f"Successfully parsed {len(self.partitions)} partitions from GPT.")
+            return True
+
+        except (struct.error, IndexError, UnicodeDecodeError) as e:
+            log.error(f"Error during GPT data parsing: {e}")
+            return False
 
 
 def main():
@@ -1005,10 +1180,19 @@ def main():
                     tool.cmd_fdl(action_parts[1], int(action_parts[2], 0))
                 elif command == 'exec':
                     tool.cmd_exec()
-                elif command == 'read_part':
+                elif command in ['r', 'read_part']:
+                    if len(action_parts) < 3:
+                        log.error("Usage: read_part <partition_name> <output_file>")
+                        continue
                     tool.cmd_read_part(action_parts[1], action_parts[2])
+
+                elif command in ['w', 'write_part']:
+                    if len(action_parts) < 3:
+                        log.error("Usage: write_part <partition_name> <input_file>")
+                        continue
+                    tool.cmd_write_part(action_parts[1], action_parts[2])
                 elif command == 'help':
-                    print("Available commands: fdl, exec, read_part, p, print, chip_uid, poweroff, reset, quit")
+                    print("Available commands: fdl, exec, read_part, write_part, p, print, chip_uid, poweroff, reset, quit")
                 elif command in ['p', 'print']:
                     tool.cmd_print_partitions()
                 elif command == 'chip_uid':
