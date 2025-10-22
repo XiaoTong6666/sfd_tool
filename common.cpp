@@ -3430,7 +3430,7 @@ void ChangeMode(spdio_t *io, int ms, int bootmode, int at) {
 				if (io->recv_buf[2] == BSL_REP_VER) return;
 				else ERR_EXIT("kick reboot timeout, reboot your phone by pressing POWER and VOL_UP for 7-10 seconds.\n");
 			}
-			usleep(100000);
+			usleep(10000);
 		}
 		if (!at) done = 1;
 	}
