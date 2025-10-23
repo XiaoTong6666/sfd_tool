@@ -17,7 +17,6 @@ from enum import IntEnum
 logging.basicConfig(level=logging.INFO, format='[%(levelname)s] %(message)s')
 log = logging.getLogger(__name__)
 
-# --- 从 C++ 代码中提取的常量 ---
 class BSL_CMD(IntEnum):
     """BSL/FDL 命令代码"""
     CONNECT = 0x00
@@ -68,38 +67,38 @@ class SpdProtocol:
     """封装展讯 BSL/FDL 协议的底层通信"""
       # CRC-16/CCITT-FALSE (initial value 0xFFFF) 的查找表
     _CRC16_TABLE = [
-        0x0000, 0x1021, 0x2042, 0x3063, 0x4084, 0x50a5, 0x60c6, 0x70e7,
-        0x8108, 0x9129, 0xa14a, 0xb16b, 0xc18c, 0xd1ad, 0xe1ce, 0xf1ef,
-        0x1231, 0x0210, 0x3273, 0x2252, 0x52b5, 0x4294, 0x72f7, 0x62d6,
-        0x9339, 0x8318, 0xb37b, 0xa35a, 0xd3bd, 0xc39c, 0xf3ff, 0xe3de,
-        0x2462, 0x3443, 0x0420, 0x1401, 0x64e6, 0x74c7, 0x44a4, 0x5485,
-        0xa56a, 0xb54b, 0x8528, 0x9509, 0xe5ee, 0xf5cf, 0xc5ac, 0xd58d,
-        0x3653, 0x2672, 0x1611, 0x0630, 0x76d7, 0x66f6, 0x5695, 0x46b4,
-        0xb75b, 0xa77a, 0x9719, 0x8738, 0xf7df, 0xe7fe, 0xd79d, 0xc7bc,
-        0x48c4, 0x58e5, 0x6886, 0x78a7, 0x0840, 0x1861, 0x2802, 0x3823,
-        0xc9cc, 0xd9ed, 0xe98e, 0xf9af, 0x8948, 0x9969, 0xa90a, 0xb92b,
-        0x5af5, 0x4ad4, 0x7ab7, 0x6a96, 0x1a71, 0x0a50, 0x3a33, 0x2a12,
-        0xdbfd, 0xcbdc, 0xfbbf, 0xeb9e, 0x9b79, 0x8b58, 0xbb3b, 0xab1a,
-        0x6ca6, 0x7c87, 0x4ce4, 0x5cc5, 0x2c22, 0x3c03, 0x0c60, 0x1c41,
-        0xedae, 0xfd8f, 0xcdec, 0xddcd, 0xad2a, 0xbd0b, 0x8d68, 0x9d49,
-        0x7e97, 0x6eb6, 0x5ed5, 0x4ef4, 0x3e13, 0x2e32, 0x1e51, 0x0e70,
-        0xff9f, 0xefbe, 0xdfdd, 0xcffc, 0xbf1b, 0xaf3a, 0x9f59, 0x8f78,
-        0x9188, 0x81a9, 0xb1ca, 0xa1eb, 0xd10c, 0xc12d, 0xf14e, 0xe16f,
-        0x1080, 0x00a1, 0x30c2, 0x20e3, 0x5004, 0x4025, 0x7046, 0x6067,
-        0x83b9, 0x9398, 0xa3fb, 0xb3da, 0xc33d, 0xd31c, 0xe37f, 0xf35e,
-        0x02b1, 0x1290, 0x22f3, 0x32d2, 0x4235, 0x5214, 0x6277, 0x7256,
-        0xb5ea, 0xa5cb, 0x95a8, 0x8589, 0xf56e, 0xe54f, 0xd52c, 0xc50d,
-        0x34e2, 0x24c3, 0x14a0, 0x0481, 0x7466, 0x6447, 0x5424, 0x4405,
-        0xa7db, 0xb7fa, 0x8799, 0x97b8, 0xe75f, 0xf77e, 0xc71d, 0xd73c,
-        0x26d3, 0x36f2, 0x0691, 0x16b0, 0x6657, 0x7676, 0x4615, 0x5634,
-        0xd94c, 0xc96d, 0xf90e, 0xe92f, 0x99c8, 0x89e9, 0xb98a, 0xa9ab,
-        0x5844, 0x4865, 0x7806, 0x6827, 0x18c0, 0x08e1, 0x3882, 0x28a3,
-        0xcb7d, 0xdb5c, 0xeb3f, 0xfb1e, 0x8bf9, 0x9bd8, 0xabbb, 0xbb9a,
-        0x4a75, 0x5a54, 0x6a37, 0x7a16, 0x0af1, 0x1ad0, 0x2ab3, 0x3a92,
-        0xfd2e, 0xed0f, 0xdd6c, 0xcd4d, 0xbdaa, 0xad8b, 0x9de8, 0x8dc9,
-        0x7c26, 0x6c07, 0x5c64, 0x4c45, 0x3ca2, 0x2c83, 0x1ce0, 0x0cc1,
-        0xef1f, 0xff3e, 0xcf5d, 0xdf7c, 0xaf9b, 0xbfba, 0x8fd9, 0x9ff8,
-        0x6e17, 0x7e36, 0x4e55, 0x5e74, 0x2e93, 0x3eb2, 0x0ed1, 0x1ef0,
+        0x0000, 0xC0C1, 0xC181, 0x0140, 0xC301, 0x03C0, 0x0280, 0xC241,
+        0xC601, 0x06C0, 0x0780, 0xC741, 0x0500, 0xC5C1, 0xC481, 0x0440,
+        0xCC01, 0x0CC0, 0x0D80, 0xCD41, 0x0F00, 0xCFC1, 0xCE81, 0x0E40,
+        0x0A00, 0xCAC1, 0xCB81, 0x0B40, 0xC901, 0x09C0, 0x0880, 0xC841,
+        0xD801, 0x18C0, 0x1980, 0xD941, 0x1B00, 0xDBC1, 0xDA81, 0x1A40,
+        0x1E00, 0xDEC1, 0xDF81, 0x1F40, 0xDD01, 0x1DC0, 0x1C80, 0xDC41,
+        0x1400, 0xD4C1, 0xD581, 0x1540, 0xD701, 0x17C0, 0x1680, 0xD641,
+        0xD201, 0x12C0, 0x1380, 0xD341, 0x1100, 0xD1C1, 0xD081, 0x1040,
+        0xF001, 0x30C0, 0x3180, 0xF141, 0x3300, 0xF3C1, 0xF281, 0x3240,
+        0x3600, 0xF6C1, 0xF781, 0x3740, 0xF501, 0x35C0, 0x3480, 0xF441,
+        0x3C00, 0xFCC1, 0xFD81, 0x3D40, 0xFF01, 0x3FC0, 0x3E80, 0xFE41,
+        0xFA01, 0x3AC0, 0x3B80, 0xFB41, 0x3900, 0xF9C1, 0xF881, 0x3840,
+        0x2800, 0xE8C1, 0xE981, 0x2940, 0xEB01, 0x2BC0, 0x2A80, 0xEA41,
+        0xEE01, 0x2EC0, 0x2F80, 0xEF41, 0x2D00, 0xEDC1, 0xEC81, 0x2C40,
+        0xE401, 0x24C0, 0x2580, 0xE541, 0x2700, 0xE7C1, 0xE681, 0x2640,
+        0x2200, 0xE2C1, 0xE381, 0x2340, 0xE101, 0x21C0, 0x2080, 0xE041,
+        0xA001, 0x60C0, 0x6180, 0xA141, 0x6300, 0xA3C1, 0xA281, 0x6240,
+        0x6600, 0xA6C1, 0xA781, 0x6740, 0xA501, 0x65C0, 0x6480, 0xA441,
+        0x6C00, 0xACC1, 0xAD81, 0x6D40, 0xAF01, 0x6FC0, 0x6E80, 0xAE41,
+        0xAA01, 0x6AC0, 0x6B80, 0xAB41, 0x6900, 0xA9C1, 0xA881, 0x6840,
+        0x7800, 0xB8C1, 0xB981, 0x7940, 0xBB01, 0x7BC0, 0x7A80, 0xBA41,
+        0xBE01, 0x7EC0, 0x7F80, 0xBF41, 0x7D00, 0xBDC1, 0xBC81, 0x7C40,
+        0xB401, 0x74C0, 0x7580, 0xB541, 0x7700, 0xB7C1, 0xB681, 0x7640,
+        0x7200, 0xB2C1, 0xB381, 0x7340, 0xB101, 0x71C0, 0x7080, 0xB041,
+        0x5000, 0x90C1, 0x9181, 0x5140, 0x9301, 0x53C0, 0x5280, 0x9241,
+        0x9601, 0x56C0, 0x5780, 0x9741, 0x5500, 0x95C1, 0x9481, 0x5440,
+        0x9C01, 0x5CC0, 0x5D80, 0x9D41, 0x5F00, 0x9FC1, 0x9E81, 0x5E40,
+        0x5A00, 0x9AC1, 0x9B81, 0x5B40, 0x9901, 0x59C0, 0x5880, 0x9841,
+        0x8801, 0x48C0, 0x4980, 0x8941, 0x4B00, 0x8BC1, 0x8A81, 0x4A40,
+        0x4E00, 0x8EC1, 0x8F81, 0x4F40, 0x8D01, 0x4DC0, 0x4C80, 0x8C41,
+        0x4400, 0x84C1, 0x8581, 0x4540, 0x8701, 0x47C0, 0x4680, 0x8641,
+        0x8201, 0x42C0, 0x4380, 0x8341, 0x4100, 0x81C1, 0x8081, 0x4040,
     ]
 
     def __init__(self, device: usb.core.Device, verbose: int = 0):
@@ -152,7 +151,7 @@ class SpdProtocol:
     @staticmethod
     def _spd_crc16(data: bytes) -> int:
         """
-        复刻非标准 CRC-16 算法。
+        复刻非标准 CRC-16 算法
         多项式: 0x11021
         初始值: 0
         """
@@ -168,7 +167,7 @@ class SpdProtocol:
 
     @staticmethod
     def _spd_checksum(data: bytes) -> int:
-        """展讯自定义的SUM校验和，精确复刻C++版本，包含最后的字节交换。"""
+        """展讯自定义的SUM校验和，字节交换"""
         checksum = 0
         data_len = len(data)
         i = 0
@@ -256,8 +255,8 @@ class SpdProtocol:
 
     def recv_msg(self, timeout: Optional[int] = None) -> Tuple[int, bytes]:
         """
-        接收、解码并验证一个完整的BSL消息。
-        包含针对 non-transcode 模式的专用高速路径，以最大化性能。
+        接收、解码并验证一个完整的BSL消息
+        包含针对 non-transcode 模式的专用高速路径，以最大化性能
         """
         if timeout is None:
             timeout = self.timeout
@@ -316,7 +315,7 @@ class SpdProtocol:
             else:
                 del raw_stream[:end_marker_offset]
 
-            # --- 在这里执行校验 ---
+            # 在这里执行校验
             # (这部分逻辑和之前完全一样)
             msg_type, msg_len = struct.unpack('>HH', payload[:4])
             # 此处省略了校验逻辑，因为它和之前版本完全一样，为了简洁
@@ -390,7 +389,7 @@ class SpdProtocol:
         return msg_type, payload[4:-2]
 
     def send_and_check_ack(self, cmd: int, data: bytes = b'', timeout: Optional[int] = None) -> bytes:
-        """发送命令并期望收到ACK，如果成功则返回ACK中的数据。允许覆盖超时。"""
+        """发送命令并期望收到ACK，如果成功则返回ACK中的数据允许覆盖超时"""
         while True:
             self.send_cmd(cmd, data)
             # 如果没有提供自定义超时，则使用默认值
@@ -403,18 +402,18 @@ class SpdProtocol:
             return rep_data
 
     def _clear_in_buffer(self):
-        """通过以短超时持续读取来清空IN端点缓冲区中的所有陈旧数据。"""
+        """通过以短超时持续读取来清空IN端点缓冲区中的所有陈旧数据"""
         if self.verbose >= 2:
             log.debug("Clearing IN endpoint buffer...")
         cleared_bytes_count = 0
         while True:
             try:
-                # 使用非常短的超时（1毫秒）来尝试读取。
-                # 如果有数据，它会立即返回。如果没有，它会立即超时。
+                # 使用非常短的超时（1毫秒）来尝试读取
+                # 如果有数据，它会立即返回如果没有，它会立即超时
                 data = self.ep_in.read(self.ep_in.wMaxPacketSize, timeout=1)
                 cleared_bytes_count += len(data)
             except usb.core.USBError as e:
-                # 捕获预期的超时错误，这意味着缓冲区已空。
+                # 捕获预期的超时错误，这意味着缓冲区已空
                 # 在 Linux 上 errno 通常是 110 (ETIMEDOUT)
                 if e.errno == 110 or 'timeout' in str(e).lower():
                     break
@@ -427,8 +426,8 @@ class SpdProtocol:
 
     def read_flash(self, addr: int, offset: int, size: int) -> bytes:
         """
-        一个底层的辅助函数，用于从给定的物理地址读取数据块。
-        这对应于 C++ 中的 BSL_CMD_READ_FLASH。
+        一个底层的辅助函数，用于从给定的物理地址读取数据块
+        BSL_CMD_READ_FLASH
         """
         # 构造请求包: addr (u32), size (u32), offset (u32)
         # 注意：这些是32位的值
@@ -510,14 +509,14 @@ class SfdTool:
             self.proto = None
 
         log.info("Kick command sent. Waiting for device to reappear...")
-        # --- 开始修改 ---
+        # 开始修改
         # 增加一个更长的固定延时，以确保 udev 有足够的时间
-        # 在脚本尝试重新连接之前应用权限规则。
+        # 在脚本尝试重新连接之前应用权限规则
         log.info("Applying a 1-second delay for device re-enumeration...")
         time.sleep(1)
 
     def _print_usb_debug_info(self):
-        """扫描并打印所有可见的USB设备以供调试。"""
+        """扫描并打印所有可见的USB设备以供调试"""
         log.debug("--- USB Device Debug Information ---")
         try:
             # 尝试查找PyUSB后端
@@ -594,7 +593,7 @@ class SfdTool:
         return dev
 
     def handshake(self):
-        """与设备执行初始握手以确定其状态，精确模仿C++流程。"""
+        """与设备执行初始握手以确定其状态"""
         if not self.proto:
             raise RuntimeError("Device not connected.")
 
@@ -729,29 +728,29 @@ class SfdTool:
             raise SpdProtocolError("FDL1 handshake failed.")
 
     def _pack_partition_select_packet(self, name: str, size: int) -> bytes:
-        """辅助函数，用于打包分区选择数据包。"""
+        """辅助函数，用于打包分区选择数据包"""
         # 名称是36个wchar (72字节), UTF-16LE编码
         name_bytes = name.encode('utf-16le')
         packet = name_bytes.ljust(72, b'\x00')
-        # BSL协议在这里使用32位小端整数（<I），而不是64位（<Q）。
+        # BSL协议在这里使用32位小端整数（<I），而不是64位（<Q）
         packet += struct.pack('<I', size)
         return packet
 
     def _pack_partition_select_packet(self, name: str, size: int) -> bytes:
         """
-        辅助函数，用于打包分区选择数据包。
-        名称(72字节) + 大小(4字节)。
+        辅助函数，用于打包分区选择数据包
+        名称(72字节) + 大小(4字节)
         """
         name_bytes = name.encode('utf-16le')
         packet = name_bytes.ljust(72, b'\x00')
-        # BSL协议在这里使用32位小端整数（<I），而不是64位（<Q）。
+        # BSL协议在这里使用32位小端整数（<I），而不是64位（<Q）
         packet += struct.pack('<I', size)
         return packet
 
-    def check_partition(self, name: str) -> Tuple[bool, int]:
+    def check_partition(self, name: str, need_size: bool = True) -> Tuple[bool, int]:
         """
-        通过探测来检查分区是否存在，并使用精确复刻自 C++ 的高效位操作二分搜索算法
-        来估算其大小。
+        通过探测来检查分区是否存在，并使用二分搜索算法
+        来估算其大小
         """
         if not self.proto: return False, 0
 
@@ -760,13 +759,38 @@ class SfdTool:
             if name.endswith('1'):
                 probing_name = name[:-1] + '2'
 
-        # 步骤 1: 检查存在性 (这个逻辑是正确的)
+        # 步骤 1: 检查存在性
+        exists = False
         try:
+            # 1. 发送 READ_START
             start_packet = self._pack_partition_select_packet(probing_name, 8)
             self.proto.send_and_check_ack(BSL_CMD.READ_START, start_packet, timeout=1000)
-            self.proto.send_and_check_ack(BSL_CMD.READ_END, timeout=1000)
-        except SpdProtocolError:
-            return False, 0
+
+            # 2. 尝试用 READ_MIDST 读取一小块数据 (最关键的一步)
+            read_midst_packet = struct.pack('<II', 8, 0) # 读取 8 字节，从偏移 0 开始
+            self.proto.send_cmd(BSL_CMD.READ_MIDST, read_midst_packet)
+            rep_type, _ = self.proto.recv_msg(timeout=1000)
+
+            # 3. 只有当响应是 READ_FLASH 时，分区才真正存在
+            if rep_type == BSL_REP.READ_FLASH:
+                exists = True
+
+        except (SpdProtocolError, usb.core.USBError):
+            # 任何协议或USB错误都意味着检查失败
+            exists = False
+        finally:
+            # 4. 无论成功与否，都发送 READ_END 来清理会话
+            try:
+                self.proto.send_and_check_ack(BSL_CMD.READ_END)
+            except (SpdProtocolError, usb.core.USBError):
+                # 即使清理失败也无妨，因为我们已经得到了存在性的答案
+                pass
+
+        if not exists:
+            return False, 0 # 如果不存在，立即返回
+
+        if not need_size:
+            return True, 0 # 如果只检查存在性，到此为止
 
         # 步骤 2: 探测大小 - 决定使用快速路径还是慢速路径
         log.info(f"Probing size for '{probing_name}'...")
@@ -780,7 +804,7 @@ class SfdTool:
         except SpdProtocolError:
             log.warning("Device failed on large read, falling back to slow probing path (NAND style).")
 
-        # 步骤 3: 使用 C++ 的位操作搜索算法
+        # 步骤 3: 使用位操作搜索算法
         offset = 0
         incrementing = True
         end = 20 if use_fast_path else 10 # 不同的路径有不同的探测下限
@@ -814,7 +838,6 @@ class SfdTool:
             if self.verbose >= 2:
                 log.debug(f"Probe at shift {i}: offset={probe_offset:#x} -> {'OK' if probe_ok else 'FAIL'}")
 
-            # C++ 的 incrementing 逻辑
             if incrementing:
                 if not probe_ok:
                     offset += (1 << (i - 1))
@@ -833,14 +856,13 @@ class SfdTool:
 
         final_size = offset
         if use_fast_path and end == 20:
-            # C++ 代码中没有减去 (1 << end)，但逻辑上可能需要
-            # 经过测试，看起来C++代码最后没有减，我们保持一致
+            # 没有减去 (1 << end)，保持一致
             pass
         elif not use_fast_path and end == 10:
-            # C++代码的慢速路径有一个最终的减法
+            # 慢速路径最终的减法
             final_size -= (1 << end)
 
-        # 添加C++版本最后的对齐逻辑
+        # 添加对齐逻辑
         if final_size > 1024 * 1024:
             final_size = (final_size + 1024*1024 - 1) & ~(1024*1024 - 1)
         elif final_size > 1024:
@@ -850,8 +872,8 @@ class SfdTool:
 
     def _get_partition_table(self):
         """
-        在FDL2阶段获取设备分区表。
-        优先尝试高效的GPT解析，如果失败，则回退到兼容性探测模式。
+        在FDL2阶段获取设备分区表
+        优先尝试高效的GPT解析，如果失败，则回退到兼容性探测模式
         """
         if self.device_stage != "FDL2" or not self.proto:
             return
@@ -861,14 +883,14 @@ class SfdTool:
         if self._get_partitions_from_gpt():
             return  # 成功，任务完成！
 
-        # --- 如果 GPT 方法失败，回退到原来的慢速方法 ---
+        # 如果 GPT 方法失败，回退到原来的慢速方法
         log.info("GPT method failed. Switching to compatibility mode (probing common partitions)...")
         original_verbose = self.proto.verbose
         if self.verbose > 0: self.proto.verbose = 0
 
         for part_name in self.COMMON_PARTITIONS:
             print(f"\rProbing: {part_name:<20}", end="")
-            exists, size_in_bytes = self.check_partition(part_name)
+            exists, size_in_bytes = self.check_partition(part_name, need_size=True)
             if exists:
                 self.partitions.append({'name': part_name, 'size': size_in_bytes})
 
@@ -877,7 +899,7 @@ class SfdTool:
         log.info(f"Found {len(self.partitions)} partitions via compatibility mode.")
 
     def cmd_print_partitions(self):
-        """格式化并打印已加载的分区表。"""
+        """格式化并打印已加载的分区表"""
         if not self.partitions:
             log.warning("Partition table not loaded. Try 'exec' in FDL1 stage first.")
             return
@@ -889,7 +911,7 @@ class SfdTool:
             print(f"{i:5d} {part['name']:<36} {size_mb:7.2f}MB")
 
     def cmd_chip_uid(self):
-        """读取并打印芯片唯一ID。"""
+        """读取并打印芯片唯一ID"""
         if self.device_stage != "FDL2" or not self.proto:
             log.error("Chip UID can only be read in FDL2 stage.")
             return
@@ -922,14 +944,14 @@ class SfdTool:
             log.warning(f"Keep charge command failed (this is normal on some devices): {e}")
 
     def _find_partition_info(self, name: str) -> Optional[dict]:
-        """从已加载的分区列表中查找分区的名称和大小。"""
+        """从已加载的分区列表中查找分区的名称和大小"""
         for part in self.partitions:
             if part['name'] == name:
                 return part
         return None
 
     def _print_progress_bar(self, done: int, total: int, start_time: float, desc: str = ""):
-        """打印一个简单的文本进度条。"""
+        """打印一个简单的文本进度条"""
         if total == 0: return
         percent = 100 * (done / float(total))
         elapsed_time = time.time() - start_time
@@ -944,7 +966,7 @@ class SfdTool:
             print()
 
     def cmd_read_part(self, partition_name: str, out_file: str):
-        """从设备读取一个分区并将其保存到文件。"""
+        """从设备读取一个分区并将其保存到文件"""
         if self.device_stage != "FDL2":
             log.error("Reading partitions is only supported in FDL2 stage.")
             return
@@ -1008,7 +1030,7 @@ class SfdTool:
             log.error(f"File write error: {e}")
 
     def cmd_write_part(self, partition_name: str, in_file: str):
-        """将一个文件写入到设备的指定分区。"""
+        """将一个文件写入到设备的指定分区"""
         if self.device_stage != "FDL2":
             log.error("Writing partitions is only supported in FDL2 stage.")
             return
@@ -1065,7 +1087,7 @@ class SfdTool:
 
     def _get_partitions_from_gpt(self) -> bool:
         """
-        获取分区表，通过直接读取闪存开头的物理扇区并解析GPT。
+        获取分区表，通过直接读取闪存开头的物理扇区并解析GPT
         """
         if not self.proto or self.device_stage != "FDL2":
             return False
@@ -1102,8 +1124,7 @@ class SfdTool:
 
         # 2. 解析 GPT 头和分区条目
         try:
-            # 从GPT头中解析分区数组的起始位置、条目数和每个条目的大小
-            # 偏移72字节对应C++中的 `partition_entry_lba` 字段
+            # 从GPT头中解析分区数组的起始位置、条目数和每个条目的大小,偏移72字节
             part_array_lba, num_parts, part_entry_size = struct.unpack_from(
                 '<QII', raw_data, gpt_header_offset + 72
             )
@@ -1158,8 +1179,7 @@ class SfdTool:
 
     def _get_partitions_from_bsl_cmd(self) -> bool:
         """
-        尝试通过发送 BSL_CMD_READ_PARTITION 命令来获取分区表。
-        这模仿了 C++ 版本的第二个（次快）后备方案。
+        尝试通过发送 BSL_CMD_READ_PARTITION 命令来获取分区表
         """
         if not self.proto: return False
 
@@ -1178,7 +1198,7 @@ class SfdTool:
 
             num_parts = len(rep_data) // 76
 
-            # --- 模仿 C++ 的动态扇区大小检测 ---
+            # 动态扇区大小检测
             # 第一次遍历，找出计算因子 'divisor'
             divisor = 10
             for i in range(num_parts):
@@ -1191,7 +1211,7 @@ class SfdTool:
 
             log.info(f"Dynamically detected sector size factor (divisor): {divisor}")
 
-            # --- 第二次遍历，解析并计算最终大小 ---
+            # 第二次遍历，解析并计算最终大小
             # 特殊处理 splloader
             self.partitions.append({'name': 'splloader', 'size': 256 * 1024})
 
@@ -1201,10 +1221,7 @@ class SfdTool:
                 if not part_name: continue
 
                 size_in_sectors = struct.unpack('<I', chunk[72:76])[0]
-                # C++ 逻辑: (long long)size << (20 - divisor)
-                # 20 - divisor: 10 -> 1KB sectors -> << 10
-                #               9 -> 512B sectors -> << 9
-                # 1MB = 1<<20 bytes.
+
                 part_size = size_in_sectors * (1 << (20 - divisor))
 
                 self.partitions.append({'name': part_name, 'size': part_size})
@@ -1220,6 +1237,7 @@ class SfdTool:
         except (SpdProtocolError, struct.error, UnicodeDecodeError) as e:
             log.error(f"Error parsing partitions from BSL command: {e}")
             return False
+
 
 def main():
     parser = argparse.ArgumentParser(description="Python reimplementation of sfd_tool for UNISOC devices.")
