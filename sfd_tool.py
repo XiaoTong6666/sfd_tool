@@ -446,12 +446,27 @@ class SpdProtocol:
 class SfdTool:
     """实现sfd_tool的高级功能"""
     COMMON_PARTITIONS = [
-        "splloader", "prodnv", "miscdata", "recovery", "misc", "trustos","trustos_bak",
-        "sml", "sml_bak","uboot", "uboot_bak","uboot_log", "logo", "logo_2", "logo_3", "logo_4",
-        "logo_5", "logo_6", "fbootlogo", "l_fixnv1", "l_fixnv2", "l_runtimenv1",
-        "l_runtimenv2", "gpsgl", "gpsbd", "wcnmodem", "persist", "l_modem",
-        "l_deltanv", "l_gdsp", "l_ldsp", "pm_sys", "boot", "system", "cache",
-        "vendor", "userdata", "vbmeta", "vbmeta_bak"
+        "splloader", "prodnv", "miscdata", "recovery", "misc", "trustos", "trustos_bak",
+        "sml", "sml_bak", "uboot", "uboot_bak", "logo", "logo_1", "logo_2", "logo_3",
+        "logo_4", "logo_5", "logo_6", "fbootlogo",
+        "l_fixnv1", "l_fixnv2", "l_runtimenv1", "l_runtimenv2",
+        "gpsgl", "gpsbd", "wcnmodem", "persist", "l_modem",
+        "l_deltanv", "l_gdsp", "l_ldsp", "pm_sys", "boot",
+        "system", "cache", "vendor", "uboot_log", "userdata", "dtb", "socko",
+        "vbmeta", "vbmeta_bak", "vbmeta_system",
+        "trustos_a", "trustos_b", "sml_a", "sml_b", "teecfg", "teecfg_a", "teecfg_b",
+        "uboot_a", "uboot_b", "gnssmodem_a", "gnssmodem_b", "wcnmodem_a",
+        "wcnmodem_b", "l_modem_a", "l_modem_b", "l_deltanv_a", "l_deltanv_b",
+        "l_gdsp_a", "l_gdsp_b", "l_ldsp_a", "l_ldsp_b", "l_agdsp_a", "l_agdsp_b",
+        "l_cdsp_a", "l_cdsp_b", "pm_sys_a", "pm_sys_b", "boot_a", "boot_b",
+        "vendor_boot_a", "vendor_boot_b", "dtb_a", "dtb_b", "dtbo_a", "dtbo_b",
+        "super", "socko_a", "socko_b", "odmko_a", "odmko_b", "vbmeta_a", "vbmeta_b",
+        "metadata", "sysdumpdb", "vbmeta_system_a", "vbmeta_system_b",
+        "vbmeta_vendor_a", "vbmeta_vendor_b", "vbmeta_system_ext_a",
+        "vbmeta_system_ext_b", "vbmeta_product_a", "nr_fixnv1", "nr_fixnv2",
+        "nr_runtimenv1", "nr_runtimenv2", "nr_pmsys", "nr_agdsp", "nr_modem",
+        "nr_v3phy", "nr_nrphy", "nr_nrdsp1", "nr_nrdsp2", "nr_deltanv", "m_raw",
+        "m_data", "m_webui", "ubipac", "vbmeta_product_b", "user_partition"
     ]
 
     def __init__(self, wait_time: int, verbose: int):
@@ -460,6 +475,7 @@ class SfdTool:
         self.proto: Optional[SpdProtocol] = None
         self.device_stage = "DISCONNECTED"
         self.partitions = []
+        self.storage_type: Optional[str] = None
 
     def cmd_kickto(self, bootmode: int, proto: SpdProtocol):
         """在一个已连接的设备上发送 kick 命令以切换模式"""
@@ -828,7 +844,6 @@ class SfdTool:
 
         self.partitions = []
 
-        # --- 优先尝试新方法 ---
         if self._get_partitions_from_gpt():
             return  # 成功，任务完成！
 
@@ -1016,7 +1031,7 @@ class SfdTool:
             self.proto.send_and_check_ack(BSL_CMD.START_DATA, start_packet)
 
             # 步骤 2: 循环发送数据
-            chunk_size = 4096  # 可以尝试更大的值以提高速度, 如 65535
+            chunk_size = 65535  # 可以尝试更大的值以提高速度, 如 65535
             sent_bytes = 0
             start_time = time.time()
             for i in range(0, file_size, chunk_size):
@@ -1043,36 +1058,40 @@ class SfdTool:
 
         log.info("Attempting high-speed partition read via GPT parsing...")
 
-        # 我们需要读取至少 34 个扇区来确保覆盖主GPT和分区条目数组。
-        # 34 * 512 = 17408 字节。我们读取一个稍大的块以确保安全。
         read_size = 32 * 1024  # 读取 32KB
 
         try:
-            # 使用新的底层 read_flash 方法从物理地址 0 开始读取
-            # C++ 代码中的 dump_partition(..., "user_partition", 0, ...) 最终也是
-            # 转换成从物理地址 0 读取。
-            raw_gpt_data = self.proto.read_flash(addr=0, offset=0, size=read_size)
-
-            if len(raw_gpt_data) < read_size:
-                log.warning(f"Short read for GPT data. Expected {read_size}, got {len(raw_gpt_data)}. Parsing may fail.")
-
+            raw_data = self.proto.read_flash(addr=0, offset=0, size=read_size)
         except SpdProtocolError as e:
             log.warning(f"Failed to read physical address 0 for GPT parsing: {e}")
             return False
 
-        try:
+        # 1. 动态检测扇区大小和存储类型
+        sector_size = 0
+        gpt_header_offset = 0
+
+        # 尝试在 LBA 1 (eMMC 常见) 寻找 GPT 头
+        if len(raw_data) > 512 and raw_data[512:512+8] == b'EFI PART':
             sector_size = 512
-            # GPT 头签名通常在 LBA 1 (偏移 512)
-            gpt_header_offset = sector_size
+            gpt_header_offset = 512
+            self.storage_type = "eMMC"
+            log.info(f"Detected GPT at offset 512, assuming eMMC with {sector_size}-byte sectors.")
+        # 否则，尝试在 4K 偏移处 (UFS 和 4Kn 驱动器常见)
+        elif len(raw_data) > 4096 and raw_data[4096:4096+8] == b'EFI PART':
+            sector_size = 4096
+            gpt_header_offset = 4096
+            self.storage_type = "UFS" # 这是一个合理的推断
+            log.info(f"Detected GPT at offset 4096, assuming UFS with {sector_size}-byte sectors.")
+        else:
+            log.warning("GPT signature 'EFI PART' not found at common offsets (512, 4096).")
+            return False
 
-            if raw_gpt_data[gpt_header_offset:gpt_header_offset+8] != b'EFI PART':
-                log.warning("GPT signature 'EFI PART' not found at offset 512.")
-                return False
-
-            # 解析GPT头，获取分区条目数组的位置和大小
-            # '>QII' 分别对应 partition_entry_lba, number_of_partition_entries, size_of_partition_entry
+        # 2. 解析 GPT 头和分区条目
+        try:
+            # 从GPT头中解析分区数组的起始位置、条目数和每个条目的大小
+            # 偏移72字节对应C++中的 `partition_entry_lba` 字段
             part_array_lba, num_parts, part_entry_size = struct.unpack_from(
-                '<QII', raw_gpt_data, gpt_header_offset + 72 # 注意：C++源码偏移量是72
+                '<QII', raw_data, gpt_header_offset + 72
             )
 
             if part_entry_size == 0 or num_parts == 0 or part_entry_size < 128:
@@ -1080,40 +1099,113 @@ class SfdTool:
                 return False
 
             part_array_offset = int(part_array_lba * sector_size)
-            self.partitions = []
 
-            # 遍历分区条目数组
+            temp_partitions = [] # 使用临时列表，最后再处理 splloader
+
             for i in range(num_parts):
                 entry_offset = part_array_offset + (i * part_entry_size)
 
-                # 检查是否有足够的数据来解析这个条目
-                if entry_offset + part_entry_size > len(raw_gpt_data):
-                    break # 数据不足，停止解析
+                if entry_offset + part_entry_size > len(raw_data):
+                    log.warning("Partition entry data is beyond the read buffer. Stopping parse.")
+                    break
 
-                # 从条目中提取起始LBA，结束LBA和分区名
-                start_lba, end_lba = struct.unpack_from('<QQ', raw_gpt_data, entry_offset + 32)
+                # 提取起始LBA、结束LBA和分区名
+                start_lba, end_lba = struct.unpack_from('<QQ', raw_data, entry_offset + 32)
+                if start_lba == 0: continue # 空条目，跳过
 
-                if start_lba == 0: continue # 空条目
-
-                name_bytes = raw_gpt_data[entry_offset + 56 : entry_offset + 56 + 72]
+                # 从偏移56处开始是72字节的分区名 (UTF-16LE)
+                name_bytes = raw_data[entry_offset + 56 : entry_offset + 56 + 72]
                 part_name = name_bytes.decode('utf-16le').split('\x00', 1)[0]
+                if not part_name: continue
+
+                # 3. 检测 A/B 分区方案
+                if self.selected_ab == 0 and part_name.endswith('_a'):
+                    log.info("Detected '_a' suffix, assuming A/B partition scheme.")
+                    self.selected_ab = 1 # 1 代表 slot a, 2 代表 slot b, 0 代表非A/B
 
                 part_size = (end_lba - start_lba + 1) * sector_size
+                temp_partitions.append({'name': part_name, 'size': part_size})
 
-                if part_name:
-                    self.partitions.append({'name': part_name, 'size': part_size})
-
-            if not self.partitions:
+            if not temp_partitions:
                 log.warning("GPT parsed, but no valid partitions were found.")
                 return False
 
-            log.info(f"Successfully parsed {len(self.partitions)} partitions from GPT.")
+            # 4. 特殊处理 splloader
+            # 将 splloader 作为第一个分区显示，即使它不在GPT中
+            self.partitions = [{'name': 'splloader', 'size': 256 * 1024}]
+            self.partitions.extend(temp_partitions)
+
+            log.info(f"Successfully parsed {len(self.partitions)} partitions (including splloader) from GPT.")
             return True
 
         except (struct.error, IndexError, UnicodeDecodeError) as e:
             log.error(f"Error during GPT data parsing: {e}")
             return False
 
+    def _get_partitions_from_bsl_cmd(self) -> bool:
+        """
+        尝试通过发送 BSL_CMD_READ_PARTITION 命令来获取分区表。
+        这模仿了 C++ 版本的第二个（次快）后备方案。
+        """
+        if not self.proto: return False
+
+        log.info("GPT method failed. Trying BSL_CMD_READ_PARTITION command...")
+        try:
+            self.proto.send_cmd(BSL_CMD.READ_PARTITION)
+            rep_type, rep_data = self.proto.recv_msg()
+
+            if rep_type != BSL_REP.READ_PARTITION:
+                log.warning(f"Expected READ_PARTITION response, but got {rep_type:#04x}. This method is not supported.")
+                return False
+
+            if not rep_data or len(rep_data) % 76 != 0: # 76 is 0x4c
+                log.warning("Received invalid data length for partition table.")
+                return False
+
+            num_parts = len(rep_data) // 76
+
+            # --- 模仿 C++ 的动态扇区大小检测 ---
+            # 第一次遍历，找出计算因子 'divisor'
+            divisor = 10
+            for i in range(num_parts):
+                chunk = rep_data[i * 76 : (i + 1) * 76]
+                # 大小是以扇区为单位的，存储在偏移 0x48 (72) 的位置，小端序
+                size_in_sectors = struct.unpack('<I', chunk[72:76])[0]
+                # 找出存储这个数值所需的最小位数
+                while not (size_in_sectors >> divisor):
+                    divisor -= 1
+
+            log.info(f"Dynamically detected sector size factor (divisor): {divisor}")
+
+            # --- 第二次遍历，解析并计算最终大小 ---
+            # 特殊处理 splloader
+            self.partitions.append({'name': 'splloader', 'size': 256 * 1024})
+
+            for i in range(num_parts):
+                chunk = rep_data[i * 76 : (i + 1) * 76]
+                part_name = chunk[:72].decode('utf-16le').split('\x00', 1)[0]
+                if not part_name: continue
+
+                size_in_sectors = struct.unpack('<I', chunk[72:76])[0]
+                # C++ 逻辑: (long long)size << (20 - divisor)
+                # 20 - divisor: 10 -> 1KB sectors -> << 10
+                #               9 -> 512B sectors -> << 9
+                # 1MB = 1<<20 bytes.
+                part_size = size_in_sectors * (1 << (20 - divisor))
+
+                self.partitions.append({'name': part_name, 'size': part_size})
+
+                # 检测 A/B 分区
+                if self.selected_ab == 0 and part_name.endswith('_a'):
+                    log.info("Detected '_a' suffix, assuming A/B partition scheme.")
+                    self.selected_ab = 1
+
+            log.info(f"Successfully parsed {len(self.partitions)} partitions via BSL command.")
+            return True
+
+        except (SpdProtocolError, struct.error, UnicodeDecodeError) as e:
+            log.error(f"Error parsing partitions from BSL command: {e}")
+            return False
 
 def main():
     parser = argparse.ArgumentParser(description="Python reimplementation of sfd_tool for UNISOC devices.")
