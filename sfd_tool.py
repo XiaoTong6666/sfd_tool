@@ -138,8 +138,8 @@ class SpdProtocol:
         if self.ep_out is None or self.ep_in is None:
             raise SpdProtocolError("Could not find IN/OUT endpoints.")
         log.info(f"Endpoints found: IN=0x{self.ep_in.bEndpointAddress:02x}, OUT=0x{self.ep_out.bEndpointAddress:02x}")
-        # 添加与 C++ 版本匹配的关键控制传输命令。
-        # 这是初始化设备通信所必需的。
+        # 添加关键控制传输命令
+        # 这是初始化设备通信所必需的
         try:
             # bmRequestType=0x21 (Host to Device, Class, Interface)
             # bRequest=34, wValue=0x601, wIndex=0
@@ -152,7 +152,7 @@ class SpdProtocol:
     @staticmethod
     def _spd_crc16(data: bytes) -> int:
         """
-        精确复刻 C++ 版本中的非标准 CRC-16 算法。
+        复刻非标准 CRC-16 算法。
         多项式: 0x11021
         初始值: 0
         """
@@ -161,7 +161,7 @@ class SpdProtocol:
             crc ^= (byte << 8)
             for _ in range(8):
                 if crc & 0x8000:
-                    crc = (crc << 1) ^ 0x1021 # 注意：在 Python 中，多项式通常省略最高位
+                    crc = (crc << 1) ^ 0x1021 # 在 Python 中，多项式通常省略最高位
                 else:
                     crc = crc << 1
         return crc & 0xFFFF
@@ -189,7 +189,7 @@ class SpdProtocol:
         # 取反
         checksum = ~checksum & 0xFFFF
 
-        # C++ 版本中针对 FDL1/FDL2 响应的关键字节交换步骤
+        # 针对 FDL1/FDL2 响应的关键字节交换步骤
         checksum = ((checksum >> 8) | (checksum << 8)) & 0xFFFF
         return checksum
 
@@ -257,101 +257,124 @@ class SpdProtocol:
     def recv_msg(self, timeout: Optional[int] = None) -> Tuple[int, bytes]:
         """
         接收、解码并验证一个完整的BSL消息。
-        这个版本精确地模仿了C++的 recv_msg_orig 和 recv_transcode 的协同工作逻辑。
+        包含针对 non-transcode 模式的专用高速路径，以最大化性能。
         """
         if timeout is None:
             timeout = self.timeout
 
         start_time = time.time()
 
-        raw_buf = bytearray() # 对应 C++ 的 io->raw_buf
-        expected_len = 6      # 对应 C++ 的 plen，初始为最小长度
+        # 累积从 USB 读取的原始字节流
+        raw_stream = bytearray()
 
-        while True:
-            # 1. 检查总体超时
-            if (time.time() - start_time) > (timeout / 1000.0):
-                raise SpdProtocolError(f"Receive timeout after {timeout}ms.")
+        # 高速路径: 当 Transcode 关闭时 (用于 FDL2 数据传输)
+        if not self.flags['transcode']:
+            # 在这个模式下，我们只需要等待一个完整的 BSL 消息，无需处理转义
 
-            # 2. 读取一块数据 (对应 recv_read_data)
-            try:
-                chunk = self.ep_in.read(self.ep_in.wMaxPacketSize, timeout=100)
-                if self.verbose >= 2: log.debug(f"RAW RECV CHUNK < {bytes(chunk).hex()}")
-            except usb.core.USBError as e:
-                if e.errno == 110: continue
-                raise
+            # 步骤 1: 找到帧的起始
+            while HDLC_HEADER not in raw_stream:
+                if (time.time() - start_time) > (timeout / 1000.0):
+                    raise SpdProtocolError("Timeout waiting for frame start (non-transcode).")
+                try:
+                    raw_stream.extend(self.ep_in.read(64 * 1024, timeout=100))
+                except usb.core.USBError as e:
+                    if e.errno != 110: raise
 
-            # 3. 将数据块送入解码器 (对应 recv_transcode 的逻辑)
+            start_index = raw_stream.find(HDLC_HEADER)
+            # 丢弃起始符前的所有垃圾数据
+            del raw_stream[:start_index]
 
-            # -- 这是 recv_transcode 的内部 while 循环的 Python 实现 --
-            head_found = len(raw_buf) > 0
-            esc = False # esc 状态只在循环内部有效
+            # 步骤 2: 累积数据直到满足 BSL 头部声明的长度
+            expected_len = -1
+            while True:
+                if (time.time() - start_time) > (timeout / 1000.0):
+                    raise SpdProtocolError("Timeout accumulating data for frame (non-transcode).")
 
-            for byte in chunk:
-                if self.flags['transcode']:
-                    # --- Transcode 模式逻辑 ---
-                    if esc:
-                        byte ^= HDLC_ESCAPE_MASK
-                        esc = False
-                    elif byte == HDLC_ESCAPE:
-                        esc = True
+                if expected_len == -1 and len(raw_stream) >= 5: # 1 (start) + 4 (header)
+                    _, msg_len_header = struct.unpack('>HH', raw_stream[1:5])
+                    expected_len = msg_len_header + 6 # 整个 payload 的长度
+
+                if expected_len != -1 and len(raw_stream) >= expected_len + 2: # +2 for start/end HDLC
+                    # 已经收到了足够的数据 (包括一个可能的结束符)
+                    break
+
+                # 读取更多数据
+                try:
+                    raw_stream.extend(self.ep_in.read(64 * 1024, timeout=100))
+                except usb.core.USBError as e:
+                    if e.errno != 110: raise
+
+            # 步骤 3: 提取并校验
+            # 此时 raw_stream[0] 是起始 0x7E
+            payload = raw_stream[1 : 1 + expected_len]
+
+            # 从流中移除已处理的数据
+            # 检查 payload 后面是否紧跟着一个结束符
+            end_marker_offset = 1 + expected_len
+            if end_marker_offset < len(raw_stream) and raw_stream[end_marker_offset] == HDLC_HEADER:
+                del raw_stream[:end_marker_offset + 1]
+            else:
+                del raw_stream[:end_marker_offset]
+
+            # --- 在这里执行校验 ---
+            # (这部分逻辑和之前完全一样)
+            msg_type, msg_len = struct.unpack('>HH', payload[:4])
+            # 此处省略了校验逻辑，因为它和之前版本完全一样，为了简洁
+            # ... 您的校验逻辑 ...
+            is_valid = True # 假设校验成功
+            # ...
+
+        # 当 Transcode 开启时 (用于握手等)
+        else: # self.flags['transcode'] is True
+            payload = bytearray()
+            in_frame = False
+            escape_next = False
+
+            while True:
+                if (time.time() - start_time) > (timeout / 1000.0):
+                    raise SpdProtocolError("Timeout waiting for frame (transcode).")
+                try:
+                    chunk = self.ep_in.read(self.ep_in.wMaxPacketSize, timeout=100)
+                except usb.core.USBError as e:
+                    if e.errno == 110: continue
+                    raise
+
+                for byte in chunk:
+                    if not in_frame:
+                        if byte == HDLC_HEADER: in_frame = True
                         continue
-                    elif byte == HDLC_HEADER:
-                        if not head_found:
-                            head_found = True
-                            raw_buf.clear() # 确保从一个干净的缓冲区开始
-                            expected_len = 6
-                        else: # 遇到第二个 0x7E
-                            # C++ 在这里会检查 nread < plen 并报错，我们在这里先忽略，让外部循环判断
-                            # 实际上，在 transcode 模式下，第二个 0x7E 总是帧的结束
-                            pass
-                        continue
 
-                    if not head_found: continue
-                    raw_buf.append(byte)
-
-                else:
-                    # --- Non-transcode 模式逻辑 ---
-                    if not head_found:
-                        if byte == HDLC_HEADER:
-                            head_found = True
-                        continue
-
-                    if len(raw_buf) == expected_len:
-                        if byte == HDLC_HEADER: # 满足结束条件
-                            break # 跳出 for 循环
-                        else:
-                            # 数据流错误，重置状态以寻找下一个帧
-                            log.warning("Non-transcode stream error: expected HDLC_HEADER at end of payload.")
-                            head_found = False
+                    if byte == HDLC_HEADER: # 帧结束
+                        if len(payload) >= 6:
+                            # 这是一个完整的候选帧，跳出循环进行处理
+                            break
+                        else: # 忽略空帧或短帧
+                            payload.clear()
                             continue
 
-                    raw_buf.append(byte)
+                    if escape_next:
+                        payload.append(byte ^ HDLC_ESCAPE_MASK)
+                        escape_next = False
+                    elif byte == HDLC_ESCAPE:
+                        escape_next = True
+                    else:
+                        payload.append(byte)
+                else: # for 循环正常结束 (没有 break)
+                    continue # 继续读取 USB 数据
+                break # 从 for 循环中 break 出来后，会跳出 while 循环
 
-                # 只要累积到4个字节，就更新预期长度
-                if len(raw_buf) == 4:
-                    _, msg_len_header = struct.unpack('>HH', raw_buf[:4])
-                    expected_len = msg_len_header + 6
-
-            # 4. 检查是否接收完毕 (对应 recv_msg_orig 的外部 while 循环)
-            if len(raw_buf) >= expected_len:
-                # 如果是 non-transcode 模式，我们可能多读了一个 0x7E，所以用 >=
-                break
-
-        # 5. 校验 (对应 recv_check_crc)
-        final_payload = raw_buf[:expected_len]
-        # (校验逻辑和之前一样)
-        msg_type, msg_len = struct.unpack('>HH', final_payload[:4])
-        received_crc = struct.unpack('>H', final_payload[-2:])[0]
+        # 两个路径都会汇集到这里
+        msg_type, msg_len = struct.unpack('>HH', payload[:4])
+        received_crc = struct.unpack('>H', payload[-2:])[0]
 
         is_valid = False
         current_mode_is_crc16 = self.flags['crc16']
-        expected_crc = self._spd_crc16(final_payload[:-2]) if current_mode_is_crc16 else self._spd_checksum(final_payload[:-2])
-
+        expected_crc = self._spd_crc16(payload[:-2]) if current_mode_is_crc16 else self._spd_checksum(payload[:-2])
         if received_crc == expected_crc:
             is_valid = True
         else:
             alt_mode_is_crc16 = not current_mode_is_crc16
-            alt_crc = self._spd_crc16(final_payload[:-2]) if alt_mode_is_crc16 else self._spd_checksum(final_payload[:-2])
+            alt_crc = self._spd_crc16(payload[:-2]) if alt_mode_is_crc16 else self._spd_checksum(payload[:-2])
             if received_crc == alt_crc:
                 log.info("Alternative checksum matched. Switching mode.")
                 self.flags['crc16'] = alt_mode_is_crc16
@@ -364,7 +387,7 @@ class SpdProtocol:
             try: log.info(f"RECV < REP: {BSL_REP(msg_type).name} ({msg_type:#04x}), Size: {msg_len}")
             except ValueError: log.info(f"RECV < REP: UNKNOWN ({msg_type:#04x}), Size: {msg_len}")
 
-        return msg_type, final_payload[4:-2]
+        return msg_type, payload[4:-2]
 
     def send_and_check_ack(self, cmd: int, data: bytes = b'', timeout: Optional[int] = None) -> bytes:
         """发送命令并期望收到ACK，如果成功则返回ACK中的数据。允许覆盖超时。"""
@@ -447,8 +470,8 @@ class SfdTool:
         log.info(f"Attempting to kick connected device with mode {bootmode}...")
 
         # 构造并发送kick命令
-        # 原始C++代码显示kick是一个原始的、非BSL协议的命令
-        # 我们需要确定是在哪个PID上执行kick，但既然您说是在4d00上，我们就直接发送
+        # kick是一个原始的、非BSL协议的命令
+        # 需要确定是在哪个PID上执行kick，但既然您说是在4d00上，我们就直接发送
         kick_payload = b'\x7e\x00\x00\x00\x00\x08\x00\xfe' + bytes([bootmode + 0x80]) + b'\x7e'
 
         try:
@@ -641,14 +664,14 @@ class SfdTool:
         elif self.device_stage == "FDL1":
             self.proto.send_cmd(BSL_CMD.EXEC_DATA)
 
-            # --- 开始修改 (重写 FDL2 握手逻辑) ---
+            # FDL2 握手逻辑
             rep_type, rep_data = self.proto.recv_msg(timeout=15000)
 
             if rep_type in [BSL_REP.ACK, BSL_REP.INCOMPATIBLE_PARTITION]:
                 log.info("FDL2 executed successfully.")
                 self.device_stage = "FDL2"
 
-                # 现在，我们解析设备返回的能力信息
+                # 解析设备返回的能力信息
                 disable_hdlc = False
                 if rep_type == BSL_REP.INCOMPATIBLE_PARTITION and len(rep_data) >= 8:
                     # 解析 DA_INFO_T 结构体中的 bDisableHDLC 标志
@@ -727,7 +750,6 @@ class SfdTool:
 
         # 步骤 1: 检查存在性 (使用 probing_name)
         try:
-            # --- 修改点 1 ---
             start_packet = self._pack_partition_select_packet(probing_name, 8)
             if self.verbose >= 2: log.debug(f"PROBE EXIST: SEND READ_START for '{probing_name}' (original: '{original_name}')")
             self.proto.send_and_check_ack(BSL_CMD.READ_START, start_packet)
@@ -923,7 +945,7 @@ class SfdTool:
             self.proto.send_and_check_ack(BSL_CMD.READ_START, start_packet)
 
             # 步骤 2: 循环读取数据
-            chunk_size = 4096  # 一个安全的读取块大小
+            chunk_size = 62 * 1024  # 一个安全的读取块大小
             with open(out_file, "wb") as f:
                 read_bytes = 0
                 start_time = time.time()
@@ -1014,8 +1036,7 @@ class SfdTool:
 
     def _get_partitions_from_gpt(self) -> bool:
         """
-        高效地获取分区表，通过直接读取闪存开头的物理扇区并解析GPT。
-        这精确地模仿了 C++ 版本的核心优化逻辑。
+        获取分区表，通过直接读取闪存开头的物理扇区并解析GPT。
         """
         if not self.proto or self.device_stage != "FDL2":
             return False
