@@ -750,89 +750,103 @@ class SfdTool:
 
     def check_partition(self, name: str) -> Tuple[bool, int]:
         """
-        通过探测来检查分区是否存在，并使用二分搜索算法估算其大小。
-        包含了对 NV 分区的特殊名称处理，并带有详细的调试日志。
+        通过探测来检查分区是否存在，并使用精确复刻自 C++ 的高效位操作二分搜索算法
+        来估算其大小。
         """
         if not self.proto: return False, 0
 
-        # NV 分区名称重映射逻辑
-        original_name = name
         probing_name = name
-        if "fixnv" in original_name or "runtimenv" in original_name:
-            if original_name.endswith('1'):
-                probing_name = original_name[:-1] + '2'
-                if self.verbose >= 2:
-                    log.debug(f"Remapping partition probe for '{original_name}' to '{probing_name}'")
+        if "fixnv" in name or "runtimenv" in name:
+            if name.endswith('1'):
+                probing_name = name[:-1] + '2'
 
-        # 步骤 1: 检查存在性 (使用 probing_name)
+        # 步骤 1: 检查存在性 (这个逻辑是正确的)
         try:
             start_packet = self._pack_partition_select_packet(probing_name, 8)
-            if self.verbose >= 2: log.debug(f"PROBE EXIST: SEND READ_START for '{probing_name}' (original: '{original_name}')")
-            self.proto.send_and_check_ack(BSL_CMD.READ_START, start_packet)
-
-            if self.verbose >= 2: log.debug(f"PROBE EXIST: SEND READ_END for '{probing_name}'")
-            self.proto.send_and_check_ack(BSL_CMD.READ_END)
-        except SpdProtocolError as e:
-            if self.verbose >= 2: log.debug(f"PROBE EXIST: FAILED for '{probing_name}' with error: {e}")
+            self.proto.send_and_check_ack(BSL_CMD.READ_START, start_packet, timeout=1000)
+            self.proto.send_and_check_ack(BSL_CMD.READ_END, timeout=1000)
+        except SpdProtocolError:
             return False, 0
 
-        # 步骤 2: 二分搜索探测大小 (使用 probing_name)
-        low = 0
-        high = 64 * 1024 * 1024 * 1024
-        partition_size = 0
-
+        # 步骤 2: 探测大小 - 决定使用快速路径还是慢速路径
+        log.info(f"Probing size for '{probing_name}'...")
+        use_fast_path = False
         try:
+            # 尝试一次性打开一个巨大的 "读取会话"
             start_packet = self._pack_partition_select_packet(probing_name, 0xFFFFFFFF)
-            if self.verbose >= 2: log.debug(f"PROBE SIZE: SEND READ_START for '{probing_name}'")
-            self.proto.send_and_check_ack(BSL_CMD.READ_START, start_packet)
+            self.proto.send_and_check_ack(BSL_CMD.READ_START, start_packet, timeout=1000)
+            use_fast_path = True
+            log.info("Device supports fast probing path (eMMC/UFS style).")
         except SpdProtocolError:
-            return True, 0
+            log.warning("Device failed on large read, falling back to slow probing path (NAND style).")
 
-        for i in range(36):
-            if high <= low: break
-            mid = low + (high - low) // 2
-            if mid == 0: mid = 1
+        # 步骤 3: 使用 C++ 的位操作搜索算法
+        offset = 0
+        incrementing = True
+        end = 20 if use_fast_path else 10 # 不同的路径有不同的探测下限
+        i = 21
 
-            read_midst_packet = struct.pack('<III', 1, mid & 0xFFFFFFFF, (mid >> 32) & 0xFFFFFFFF)
+        while i >= end:
+            probe_offset = offset + (1 << i) - (1 << end)
+
             try:
-                if self.verbose >= 2:
-                    log.debug(f"  [Probe iter {i}] Trying offset {mid:#x} ({mid/1024/1024:.2f} MB)")
-                    log.debug(f"  SEND READ_MIDST > Packet: {self.proto._pack_msg(BSL_CMD.READ_MIDST, read_midst_packet).hex()}")
-
-                self.proto.send_cmd(BSL_CMD.READ_MIDST, read_midst_packet)
-                time.sleep(0.01)
-                rep_type, rep_data = self.proto.recv_msg(timeout=1000)
-
-                if self.verbose >= 2:
-                    log.debug(f"  RECV < Type: {rep_type:#04x}, Data: {rep_data.hex()}")
-
-                if rep_type == BSL_REP.READ_FLASH:
-                    partition_size = mid + 1
-                    low = mid + 1
-                    if self.verbose >= 2: log.debug(f"  -> SUCCESS. New range: [{low:#x}, {high:#x}]")
+                # 根据路径选择探测方式
+                if use_fast_path:
+                    # 快速路径: 只发送 READ_MIDST
+                    mode64 = probe_offset > 0xFFFFFFFF
+                    if mode64:
+                        read_midst_packet = struct.pack('<III', 4, probe_offset & 0xFFFFFFFF, (probe_offset >> 32) & 0xFFFFFFFF)
+                    else:
+                        read_midst_packet = struct.pack('<II', 4, probe_offset & 0xFFFFFFFF)
+                    self.proto.send_cmd(BSL_CMD.READ_MIDST, read_midst_packet)
+                    rep_type, _ = self.proto.recv_msg(timeout=500)
+                    probe_ok = (rep_type == BSL_REP.READ_FLASH)
                 else:
-                    high = mid
-                    if self.verbose >= 2: log.debug(f"  -> FAILED. New range: [{low:#x}, {high:#x}]")
+                    # 慢速路径: 发送完整的 START/END 序列
+                    start_packet = self._pack_partition_select_packet(probing_name, probe_offset)
+                    self.proto.send_and_check_ack(BSL_CMD.READ_START, start_packet, timeout=500)
+                    self.proto.send_and_check_ack(BSL_CMD.READ_END, timeout=500)
+                    probe_ok = True
 
-            except usb.core.USBError as e:
-                if self.verbose >= 2: log.debug(f"  USBError during probe: {e}. Assuming failure.")
-                high = mid
-            except SpdProtocolError as e:
-                if self.verbose >= 2: log.debug(f"  ProtocolError during probe: {e}. Assuming failure.")
-                high = mid
+            except (SpdProtocolError, usb.core.USBError):
+                probe_ok = False
 
-        try:
-            if self.verbose >= 2: log.debug(f"PROBE SIZE: SEND READ_END for '{probing_name}'")
+            if self.verbose >= 2:
+                log.debug(f"Probe at shift {i}: offset={probe_offset:#x} -> {'OK' if probe_ok else 'FAIL'}")
+
+            # C++ 的 incrementing 逻辑
+            if incrementing:
+                if not probe_ok:
+                    offset += (1 << (i - 1))
+                    i -= 2
+                    incrementing = False
+                else:
+                    i += 1
+            else:
+                if probe_ok:
+                    offset += (1 << i)
+                i -= 1
+
+        # 最终清理
+        if use_fast_path:
             self.proto.send_and_check_ack(BSL_CMD.READ_END)
-        except SpdProtocolError:
+
+        final_size = offset
+        if use_fast_path and end == 20:
+            # C++ 代码中没有减去 (1 << end)，但逻辑上可能需要
+            # 经过测试，看起来C++代码最后没有减，我们保持一致
             pass
+        elif not use_fast_path and end == 10:
+            # C++代码的慢速路径有一个最终的减法
+            final_size -= (1 << end)
 
-        if partition_size > 1024 * 1024:
-             partition_size = (partition_size + 1024*1024 - 1) & ~(1024*1024 - 1)
-        elif partition_size > 1024:
-             partition_size = (partition_size + 1024 - 1) & ~(1024 - 1)
+        # 添加C++版本最后的对齐逻辑
+        if final_size > 1024 * 1024:
+            final_size = (final_size + 1024*1024 - 1) & ~(1024*1024 - 1)
+        elif final_size > 1024:
+            final_size = (final_size + 1024 - 1) & ~(1024 - 1)
 
-        return True, partition_size
+        return True, final_size
 
     def _get_partition_table(self):
         """
