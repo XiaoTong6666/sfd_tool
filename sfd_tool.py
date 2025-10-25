@@ -280,7 +280,7 @@ class SpdProtocol:
                 try:
                     raw_stream.extend(self.ep_in.read(64 * 1024, timeout=100))
                 except usb.core.USBError as e:
-                    if e.errno != 110: raise
+                    if e.errno not in [110, 10060]: raise
 
             start_index = raw_stream.find(HDLC_HEADER)
             # 丢弃起始符前的所有垃圾数据
@@ -304,7 +304,7 @@ class SpdProtocol:
                 try:
                     raw_stream.extend(self.ep_in.read(64 * 1024, timeout=100))
                 except usb.core.USBError as e:
-                    if e.errno != 110: raise
+                    if e.errno not in [110, 10060]: raise
 
             # 步骤 3: 提取并校验
             # 此时 raw_stream[0] 是起始 0x7E
