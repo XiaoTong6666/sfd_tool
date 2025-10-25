@@ -149,6 +149,7 @@ class SpdProtocol:
         except usb.core.USBError as e:
             # 某些设备或情况下可能会失败，记录为警告
             log.warning(f"USB control transfer failed: {e}. This may or may not be an issue.")
+            time.sleep(0.1)
 
     @staticmethod
     def _spd_crc16(data: bytes) -> int:
@@ -336,7 +337,8 @@ class SpdProtocol:
                 try:
                     chunk = self.ep_in.read(self.ep_in.wMaxPacketSize, timeout=100)
                 except usb.core.USBError as e:
-                    if e.errno == 110: continue
+                    if e.errno in [110, 10060]:
+                        continue
                     raise
 
                 for byte in chunk:
@@ -416,7 +418,8 @@ class SpdProtocol:
             except usb.core.USBError as e:
                 # 捕获预期的超时错误，这意味着缓冲区已空
                 # 在 Linux 上 errno 通常是 110 (ETIMEDOUT)
-                if e.errno == 110 or 'timeout' in str(e).lower():
+                # 在 Windows 上，超时错误码可能是 10060 (WSAETIMEDOUT)
+                if e.errno in [110, 10060] or 'timeout' in str(e).lower():
                     break
                 # 如果是其他USB错误，则重新引发
                 else:
@@ -597,6 +600,8 @@ class SfdTool:
         """与设备执行初始握手以确定其状态"""
         if not self.proto:
             raise RuntimeError("Device not connected.")
+
+        self.proto._clear_in_buffer()
 
         log.info("Starting handshake Nya...")
         # 步骤 1: 发送 CheckBaud (一个 0x7E 字节)
